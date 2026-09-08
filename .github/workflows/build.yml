@@ -1,1 +1,27 @@
+name: Build iOS App
 
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: Build iOS Project
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build Project
+        run: |
+          # If the project uses a workspace instead of a project, change -project to -workspace
+          # and specify a valid destination scheme
+          xcodebuild -list
+          # Example generic build command (adjust 'YourApp.xcodeproj' and 'YourScheme' to match the repo):
+          # xcodebuild -project YourApp.xcodeproj -scheme YourScheme -destination 'generic/platform=iOS' clean build
