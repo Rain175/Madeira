@@ -1,0 +1,490 @@
+workflows:
+  madeira-ios-build:
+    name: Madeira iOS Build
+    instance_type: mac_mini_m1
+    max_build_duration: 240
+    
+    environment:
+      xcode: latest
+      groups:
+        - ios_signing  # Group for certificates (create in Codemagic settings)
+      vars:
+        BUNDLE_ID: "com.madeira.app"  # Change this to your bundle ID
+        APP_STORE_ID: "1234567890"    # Change if publishing to App Store
+        TEAM_ID: "XXXXXXXXXX"          # Change to your Apple Team ID
+      
+    git:
+      depth: 50
+      submodules: recursive  # IMPORTANT: Clone all submodules
+    
+    scripts:
+      # ============================================
+      # PHASE 1: Environment Setup
+      # ============================================
+      - name: Print Environment Info
+        script: |
+          echo "🔍 Environment Information"
+          echo "=========================="
+          xcodebuild -version
+          echo ""
+          echo "macOS Version:"
+          sw_vers
+          echo ""
+          echo "Python Version:"
+          python3 --version
+          echo ""
+          echo "Checking Git Submodules:"
+          git submodule status
+          
+      - name: Verify Submodules Cloned
+        script: |
+          echo "🔍 Verifying submodules..."
+          if [ ! -f "FEX/CMakeLists.txt" ]; then
+            echo "❌ FEX not cloned!"
+            exit 1
+          fi
+          if [ ! -f "wine/configure" ]; then
+            echo "❌ Wine not cloned!"
+            exit 1
+          fi
+          if [ ! -f "research/dxmt/CMakeLists.txt" ]; then
+            echo "❌ DXMT not cloned!"
+            exit 1
+          fi
+          echo "✅ All submodules present"
+      
+      - name: Install Build Dependencies
+        script: |
+          echo "📦 Installing build dependencies..."
+          
+          # Install Homebrew packages if needed
+          brew install cmake ninja pkg-config autoconf automake libtool || true
+          
+          # Ensure Xcode command line tools are available
+          xcode-select --install 2>/dev/null || true
+          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+          
+          echo "✅ Dependencies installed"
+      
+      # ============================================
+      # PHASE 2: Build FEX (JIT Engine)
+      # ============================================
+      - name: Build FEX - Prepare
+        script: |
+          echo "🏗️  Building FEX (JIT Engine)..."
+          echo "This may take 2-4 hours"
+          echo ""
+          cd FEX
+          
+          # Check if already built
+          if [ -f "build-ios/FEXCore/Source/libFEXCore.a" ]; then
+            echo "✅ FEX already built, skipping..."
+            cd ..
+            exit 0
+          fi
+          
+          # Create build directory
+          mkdir -p build-ios
+          cd build-ios
+          
+      - name: Build FEX - Configure
+        script: |
+          cd FEX/build-ios
+          
+          # Configure with CMake for iOS
+          cmake \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CLANG_FORMAT=OFF \
+            -DENABLE_TESTS=OFF \
+            .. || exit 1
+          
+          echo "✅ FEX configured"
+      
+      - name: Build FEX - Compile
+        script: |
+          cd FEX/build-ios
+          
+          # Build with make (parallel build)
+          make -j4 || make -j1  # Fallback to single-threaded if parallel fails
+          
+          # Verify libraries were created
+          if [ ! -f "FEXCore/Source/libFEXCore.a" ]; then
+            echo "❌ FEX build failed!"
+            exit 1
+          fi
+          
+          echo "✅ FEX built successfully"
+          ls -lh FEXCore/Source/libFEXCore*.a
+          
+          cd ../..
+      
+      # ============================================
+      # PHASE 3: Build Wine (Windows Compatibility)
+      # ============================================
+      - name: Build Wine - Prepare
+        script: |
+          echo "🏗️  Building Wine (Windows Compatibility)..."
+          echo "This may take 2-4 hours"
+          echo ""
+          cd wine
+          
+          # Check if already built
+          if [ -f "build-ios/dlls/ntdll/libntdll_unix.a" ]; then
+            echo "✅ Wine already built, skipping..."
+            cd ..
+            exit 0
+          fi
+          
+          # Create build directory
+          mkdir -p build-ios
+          cd build-ios
+          
+      - name: Build Wine - Configure
+        script: |
+          cd wine/build-ios
+          
+          # Configure for iOS
+          ../configure \
+            --host=arm-apple-darwin \
+            --with-sysroot=$(xcrun --show-sdk-path -sdk iphoneos) \
+            --with-macosx-version-min=14.0 \
+            CC="$(xcrun -find clang)" \
+            CXX="$(xcrun -find clang++)" \
+            CFLAGS="-arch arm64 -isysroot $(xcrun --show-sdk-path -sdk iphoneos)" \
+            LDFLAGS="-arch arm64 -isysroot $(xcrun --show-sdk-path -sdk iphoneos)" \
+            --enable-ios \
+            --disable-tests \
+            || exit 1
+          
+          echo "✅ Wine configured"
+      
+      - name: Build Wine - Compile
+        script: |
+          cd wine/build-ios
+          
+          # Build with make
+          make -j4 || make -j1  # Fallback to single-threaded
+          
+          # Verify libraries
+          if [ ! -f "dlls/ntdll/libntdll_unix.a" ]; then
+            echo "❌ Wine build failed!"
+            exit 1
+          fi
+          
+          echo "✅ Wine built successfully"
+          ls -lh dlls/ntdll/libntdll_unix.a dlls/win32u/libwin32u_unix.a server/libwineserver.a 2>/dev/null || echo "⚠️  Some libraries missing"
+          
+          cd ../..
+      
+      # ============================================
+      # PHASE 4: Build DXMT (Direct3D Metal Translation)
+      # ============================================
+      - name: Build DXMT - Prepare
+        script: |
+          echo "🏗️  Building DXMT (Graphics Layer)..."
+          echo "This may take 1-2 hours"
+          echo ""
+          cd research/dxmt
+          
+          # Check if already built
+          if [ -f "build-ios/libdxmt_combined.a" ] || [ -f "../../app/libdxmt_unix.a" ]; then
+            echo "✅ DXMT already built, skipping..."
+            cd ../..
+            exit 0
+          fi
+          
+          mkdir -p build-ios
+          cd build-ios
+      
+      - name: Build DXMT - Configure
+        script: |
+          cd research/dxmt/build-ios
+          
+          # Configure with CMake for iOS
+          cmake \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            .. || exit 1
+          
+          echo "✅ DXMT configured"
+      
+      - name: Build DXMT - Compile
+        script: |
+          cd research/dxmt/build-ios
+          
+          # Build
+          make -j4 || make -j1
+          
+          echo "✅ DXMT built"
+          cd ../../..
+      
+      # ============================================
+      # PHASE 5: Build Xcode Project
+      # ============================================
+      - name: Verify All Dependencies
+        script: |
+          echo "🔍 Verifying all dependencies are built..."
+          echo ""
+          
+          MISSING=0
+          
+          # Check FEX libraries
+          echo "Checking FEX..."
+          if [ ! -f "FEX/build-ios/FEXCore/Source/libFEXCore.a" ]; then
+            echo "  ❌ libFEXCore.a missing"
+            MISSING=1
+          else
+            echo "  ✅ FEX libraries present"
+          fi
+          
+          # Check Wine libraries
+          echo "Checking Wine..."
+          if [ ! -f "wine/build-ios/dlls/ntdll/libntdll_unix.a" ]; then
+            echo "  ❌ Wine libraries missing"
+            MISSING=1
+          else
+            echo "  ✅ Wine libraries present"
+          fi
+          
+          # Check DXMT libraries
+          echo "Checking DXMT..."
+          if [ ! -f "research/dxmt/build-ios/libdxmt_combined.a" ] && [ ! -f "app/libdxmt_unix.a" ]; then
+            echo "  ⚠️  DXMT libraries missing (may not be critical)"
+          else
+            echo "  ✅ DXMT libraries present"
+          fi
+          
+          if [ $MISSING -eq 1 ]; then
+            echo ""
+            echo "❌ Some required libraries are missing!"
+            echo "Please check build logs above."
+            exit 1
+          fi
+          
+          echo ""
+          echo "✅ All dependencies verified"
+      
+      - name: Build iOS App
+        script: |
+          echo "🏗️  Building iOS App..."
+          echo ""
+          cd app
+          
+          xcodebuild clean -project Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -destination 'generic/platform=iOS'
+          
+          xcodebuild build-for-testing \
+            -project Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+          
+          echo "✅ App built successfully"
+          cd ..
+      
+      # ============================================
+      # PHASE 6: Create Archive & IPA
+      # ============================================
+      - name: Archive App
+        script: |
+          echo "📦 Creating archive..."
+          cd app
+          
+          xcodebuild archive \
+            -project Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -archivePath $CM_BUILD_DIR/Madeira.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+          
+          echo "✅ Archive created"
+          cd ..
+      
+      - name: Export IPA
+        script: |
+          echo "📦 Exporting IPA..."
+          
+          # Create export options plist
+          cat > /tmp/ExportOptions.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>ad-hoc</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+          </dict>
+          </plist>
+          EOF
+          
+          xcodebuild -exportArchive \
+            -archivePath $CM_BUILD_DIR/Madeira.xcarchive \
+            -exportPath $CM_BUILD_DIR/ipa \
+            -exportOptionsPlist /tmp/ExportOptions.plist
+          
+          echo "✅ IPA exported"
+          ls -lh $CM_BUILD_DIR/ipa/*.ipa || echo "⚠️  No IPA found"
+      
+      # ============================================
+      # PHASE 7: Upload & Artifacts
+      # ============================================
+      - name: Prepare Artifacts
+        script: |
+          echo "📦 Preparing artifacts..."
+          
+          mkdir -p $CM_BUILD_DIR/artifacts
+          
+          # Copy IPA if it exists
+          if [ -f "$CM_BUILD_DIR/ipa/Madeira.ipa" ]; then
+            cp $CM_BUILD_DIR/ipa/Madeira.ipa $CM_BUILD_DIR/artifacts/
+            echo "✅ IPA copied"
+          fi
+          
+          # Copy archive
+          cp -r $CM_BUILD_DIR/Madeira.xcarchive $CM_BUILD_DIR/artifacts/ || true
+          
+          echo "📂 Artifacts ready in $CM_BUILD_DIR/artifacts/"
+    
+    artifacts:
+      - $CM_BUILD_DIR/artifacts/**
+      - $CM_BUILD_DIR/build.log
+    
+    publishing:
+      # Email notification on build completion
+      email:
+        recipients:
+          - $CM_EMAIL
+        notify:
+          success: true
+          failure: true
+      
+      # Optional: Slack notification (add webhook in Codemagic settings)
+      slack:
+        channel: '#builds'
+        notify_on_build_start: true
+        notify:
+          success: true
+          failure: true
+      
+      # Save build logs
+      script_outputs:
+        - build_logs.txt
+
+  # ========================================
+  # SECOND WORKFLOW: Production IPA Build
+  # ========================================
+  madeira-ios-release:
+    name: Madeira iOS Release Build
+    instance_type: mac_mini_m1
+    max_build_duration: 240
+    
+    # Only trigger on tags
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: refs/tags/v*
+          include: true
+    
+    environment:
+      xcode: latest
+      groups:
+        - ios_signing
+      vars:
+        BUNDLE_ID: "com.madeira.app"
+        APP_STORE_ID: "1234567890"
+        TEAM_ID: "XXXXXXXXXX"
+    
+    git:
+      depth: 50
+      submodules: recursive
+    
+    scripts:
+      # Quick build using cache from previous builds
+      - name: Skip Library Builds (Using Cache)
+        script: |
+          echo "ℹ️  Skipping library builds - using cached versions"
+          echo "If this is first build, this will fail and you'll need to build dependencies first"
+          
+          # Verify libraries exist
+          [ -f "FEX/build-ios/FEXCore/Source/libFEXCore.a" ] || exit 1
+          [ -f "wine/build-ios/dlls/ntdll/libntdll_unix.a" ] || exit 1
+          echo "✅ Cached dependencies found"
+      
+      - name: Build App
+        script: |
+          cd app
+          xcodebuild build-for-testing \
+            -project Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -destination 'generic/platform=iOS'
+          cd ..
+      
+      - name: Archive for App Store
+        script: |
+          cd app
+          xcodebuild archive \
+            -project Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -archivePath $CM_BUILD_DIR/Madeira.xcarchive
+          cd ..
+      
+      - name: Export for App Store
+        script: |
+          cat > /tmp/AppStoreOptions.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+            <key>uploadBitcode</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          
+          xcodebuild -exportArchive \
+            -archivePath $CM_BUILD_DIR/Madeira.xcarchive \
+            -exportPath $CM_BUILD_DIR/ipa \
+            -exportOptionsPlist /tmp/AppStoreOptions.plist
+    
+    artifacts:
+      - $CM_BUILD_DIR/ipa/**
+    
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_KEY
+        key_id: $APP_STORE_CONNECT_KEY_ID
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        bundle_id: $BUNDLE_ID
